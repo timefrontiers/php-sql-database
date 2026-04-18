@@ -410,21 +410,6 @@ class MySQLiDatabase {
   }
 
   // -------------------------------------------------------------------------
-  // Escaping (Deprecated - Use Prepared Statements)
-  // -------------------------------------------------------------------------
-
-  /**
-   * @deprecated Use prepared statements instead.
-   */
-  public function escapeValue(string $value): string
-  {
-    \trigger_error('escapeValue() is deprecated. Use prepared statements instead.', \E_USER_DEPRECATED);
-    return $this->_connection
-      ? \mysqli_real_escape_string($this->_connection, $value)
-      : \addslashes($value);
-  }
-
-  // -------------------------------------------------------------------------
   // Error Handling
   // -------------------------------------------------------------------------
 
