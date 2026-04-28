@@ -248,7 +248,14 @@ class MySQLiDatabase {
     try {
       return $this->_connection->prepare($sql);
     } catch (\Throwable $th) {
-      $this->_addError('prepare', 256, $th->getMessage(), __FILE__, __LINE__);
+      $this->_addError('prepare', 256, $th->getMessage(), __FILE__, __LINE__, 7);
+      // $this->_addError('prepare', 256, $this->_last_query, __FILE__, __LINE__, 7);
+      if ($trace = debug_backtrace(DEBUG_BACKTRACE_IGNORE_ARGS, 2) && isset($trace[1])) {
+        $callerClass = $trace[1]['class'] ?? null;
+        $callerMethod = $trace[1]['function'] ?? null;
+        
+        $this->_addError('prepare', 256, "Origin: {$callerClass}/ {$callerMethod}", __FILE__, __LINE__, 7);
+      }
       return false;
     }
   }
@@ -264,6 +271,13 @@ class MySQLiDatabase {
   {
     $stmt = $this->prepare($sql);
     if (!$stmt) {
+      $this->_addError('execute', 256, "Failed to prepare query: {$sql}", __FILE__, __LINE__, 7);
+      if ($trace = debug_backtrace(DEBUG_BACKTRACE_IGNORE_ARGS, 2) && isset($trace[1])) {
+        $callerClass = $trace[1]['class'] ?? null;
+        $callerMethod = $trace[1]['function'] ?? null;
+        $this->_addError('prepare', 256, "Origin: {$callerClass}/ {$callerMethod}", __FILE__, __LINE__, 7);
+      }
+
       return false;
     }
 
@@ -281,7 +295,7 @@ class MySQLiDatabase {
       $stmt->close();
       return $result !== false ? $result : true;
     } catch (\Throwable $th) {
-      $this->_addError('execute', 256, $th->getMessage(), __FILE__, __LINE__);
+      $this->_addError('execute', 256, $th->getMessage(), __FILE__, __LINE__, 7);
       return false;
     }
   }
@@ -419,7 +433,7 @@ class MySQLiDatabase {
     string $message,
     string $file,
     int $line,
-    int $min_rank = 0
+    int $min_rank = 7
   ): void {
     $this->_errors[$context][] = [
       $min_rank,
