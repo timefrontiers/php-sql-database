@@ -317,9 +317,9 @@ class MySQLiDatabase {
     if ($result instanceof \mysqli_result) {
       $row = $result->fetch_assoc();
       $result->free();
-      return $row;
+      return $row ?? false;  // fetch_assoc() returns null on no rows → coerce to false
     }
-    return $result;
+    return false;
   }
 
   // -------------------------------------------------------------------------
