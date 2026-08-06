@@ -4,13 +4,19 @@ declare(strict_types=1);
 
 namespace TimeFrontiers;
 
+use TimeFrontiers\Contracts\TransactionalConnectionInterface;
+use TimeFrontiers\Internal\ManagesTransactions;
+
 /**
  * MySQLi Database manager.
  *
  * Maintains backward compatibility with the legacy MySQLDatabase class
- * while adding modern prepared statement support.
+ * while adding modern prepared statement and transaction support.
  */
-class MySQLiDatabase {
+class MySQLiDatabase implements TransactionalConnectionInterface
+{
+  use ManagesTransactions;
+
   protected \mysqli|null $_connection = null;
   protected string $_db_server;
   protected string $_db_server_port = '3306';
@@ -18,6 +24,7 @@ class MySQLiDatabase {
   protected string $_db_pass;
   protected string $_db_name;
   protected string|null $_last_query = null;
+  protected int $_affected_rows = 0;
   protected array $_errors = [];
 
   /**
@@ -36,9 +43,6 @@ class MySQLiDatabase {
     bool $new_conn = false,
     ?string $port = '3306'
   ) {
-    if (!$new_conn && $this->_connection) {
-      $this->closeConnection();
-    }
     $this->_db_server = $db_server;
     $this->_db_user   = $db_user;
     $this->_db_pass   = $db_pass;
@@ -58,6 +62,14 @@ class MySQLiDatabase {
    */
   public function openConnection(): bool
   {
+    if ($this->_connection !== null) {
+      $this->closeConnection();
+    }
+
+    $this->_resetTransactionState();
+    $this->_affected_rows = 0;
+    $this->_clearLastDriverFailure();
+
     try {
       $this->_connection = !empty($this->_db_name)
         ? new \mysqli(
@@ -76,27 +88,59 @@ class MySQLiDatabase {
         );
 
       if ($this->_connection->connect_error) {
-        $this->_addError('openConnection', 256, 'Failed to connect to database.', __FILE__, __LINE__);
-        $this->_addError('openConnection', $this->_connection->connect_errno, $this->_connection->connect_error, __FILE__, __LINE__);
+        $this->_captureMySQLiFailure(
+          'openConnection',
+          'Failed to connect to the database.'
+        );
+        $this->_connection = null;
         return false;
       }
 
       unset($this->_errors['openConnection']);
       return true;
-    } catch (\Throwable $th) {
-      $this->_addError('openConnection', 256, "Db Connection Error: {$th->getMessage()}", __FILE__, __LINE__);
+    } catch (\mysqli_sql_exception $e) {
+      $this->_captureMySQLiFailure(
+        'openConnection',
+        'Failed to connect to the database.',
+        $e
+      );
+      $this->_connection = null;
+      return false;
+    } catch (\Throwable $e) {
+      $this->_captureMySQLiFailure(
+        'openConnection',
+        'Failed to initialize the database connection.',
+        $e
+      );
+      $this->_connection = null;
       return false;
     }
   }
 
   /**
-   * Closes database connection.
+   * Closes database connection, abandoning any active transaction.
    */
   public function closeConnection(): void
   {
-    if ($this->_connection) {
+    if ($this->_connection === null) {
+      $this->_resetTransactionState();
+      return;
+    }
+
+    $this->_closeManagedTransaction();
+
+    try {
       $this->_connection->close();
+    } catch (\Throwable $e) {
+      $this->_captureMySQLiFailure(
+        'closeConnection',
+        'Failed to close the database connection cleanly.',
+        $e
+      );
+    } finally {
       $this->_connection = null;
+      $this->_affected_rows = 0;
+      $this->_resetTransactionState();
     }
   }
 
@@ -160,137 +204,210 @@ class MySQLiDatabase {
    */
   public function query(string $sql): \mysqli_result|bool
   {
+    $this->_last_query = $sql;
+    $this->_affected_rows = 0;
+    $this->_clearLastDriverFailure();
+
     if (!$this->checkConnection()) {
       $this->_addError('query', 256, 'No active Database connection.', __FILE__, __LINE__);
+      $this->_markTransactionStatementFailure();
       return false;
     }
-
-    $this->_last_query = $sql;
 
     try {
       $result = $this->_connection->query($sql);
-    } catch (\Throwable $th) {
-      $this->_addError('query', 256, $th->getMessage(), __FILE__, __LINE__);
+    } catch (\mysqli_sql_exception $e) {
+      $this->_captureMySQLiFailure('query', 'Database query failed.', $e);
+      $this->_markTransactionStatementFailure();
+      return false;
+    } catch (\Throwable $e) {
+      $this->_captureMySQLiFailure('query', 'Database query failed.', $e);
+      $this->_markTransactionStatementFailure();
       return false;
     }
 
-    return $this->confirmQuery($result) ? $result : false;
+    if ($result === false) {
+      $this->_captureMySQLiFailure('query', 'Database query failed.');
+      $this->_markTransactionStatementFailure();
+      return false;
+    }
+
+    $this->_affected_rows = $this->_connection->affected_rows;
+    unset($this->_errors['query']);
+    return $result;
   }
 
   /**
    * Executes multiple SQL statements.
-   *
-   * @param string $sql
-   * @return bool
    */
   public function multiQuery(string $sql): bool
   {
+    $this->_last_query = $sql;
+    $this->_affected_rows = 0;
+    $this->_clearLastDriverFailure();
+
     if (!$this->checkConnection()) {
       $this->_addError('multiQuery', 256, 'No active Database connection.', __FILE__, __LINE__);
+      $this->_markTransactionStatementFailure();
       return false;
     }
 
-    $this->_last_query = $sql;
-
     try {
       $result = $this->_connection->multi_query($sql);
-      if ($result) {
-        return true;
-      }
-    } catch (\Throwable $th) {
-      $this->_addError('multiQuery', 256, "Multi-Query Error: {$th->getMessage()}", __FILE__, __LINE__);
+    } catch (\mysqli_sql_exception $e) {
+      $this->_captureMySQLiFailure('multiQuery', 'Multi-query execution failed.', $e);
+      $this->_markTransactionStatementFailure();
+      return false;
+    } catch (\Throwable $e) {
+      $this->_captureMySQLiFailure('multiQuery', 'Multi-query execution failed.', $e);
+      $this->_markTransactionStatementFailure();
+      return false;
     }
 
-    $this->_addError('multiQuery', 256, 'Multi-Query failed!', __FILE__, __LINE__);
-    if ($this->_connection->errno) {
-      $this->_addError('multiQuery', 256, $this->_connection->error, __FILE__, __LINE__);
+    if (!$result) {
+      $this->_captureMySQLiFailure('multiQuery', 'Multi-query execution failed.');
+      $this->_markTransactionStatementFailure();
+      return false;
     }
-    return false;
+
+    $this->_affected_rows = $this->_connection->affected_rows;
+    return true;
   }
 
   /**
    * Confirms a query was successful.
    *
    * @param mixed $result
-   * @return bool
    */
   public function confirmQuery($result): bool
   {
     if (!$result) {
-      $this->_addError('query', 256, 'Database query failed.', __FILE__, __LINE__);
-      $this->_addError('query', 256, "Error: {$this->_connection->error}", __FILE__, __LINE__);
-      $this->_addError('query', 256, "Last query: {$this->_last_query}", __FILE__, __LINE__);
+      $this->_captureMySQLiFailure('query', 'Database query failed.');
+      $this->_markTransactionStatementFailure();
       return false;
     }
+
+    $this->_clearLastDriverFailure();
     unset($this->_errors['query']);
     return true;
   }
 
   // -------------------------------------------------------------------------
-  // Prepared Statements (New)
+  // Prepared Statements
   // -------------------------------------------------------------------------
 
   /**
    * Prepares a SQL statement for execution.
    *
-   * @param string $sql
    * @return \mysqli_stmt|false
    */
   public function prepare(string $sql): \mysqli_stmt|false
   {
+    $this->_last_query = $sql;
+    $this->_affected_rows = 0;
+    $this->_clearLastDriverFailure();
+
     if (!$this->checkConnection()) {
       $this->_addError('prepare', 256, 'No active Database connection.', __FILE__, __LINE__);
+      $this->_markTransactionStatementFailure();
       return false;
     }
-
-    $this->_last_query = $sql;
 
     try {
-      return $this->_connection->prepare($sql);
-    } catch (\Throwable $th) {
-      $this->_addError('prepare', 256, $th->getMessage(), __FILE__, __LINE__);
+      $statement = $this->_connection->prepare($sql);
+    } catch (\mysqli_sql_exception $e) {
+      $this->_captureMySQLiFailure('prepare', 'Failed to prepare the database statement.', $e);
+      $this->_markTransactionStatementFailure();
+      return false;
+    } catch (\Throwable $e) {
+      $this->_captureMySQLiFailure('prepare', 'Failed to prepare the database statement.', $e);
+      $this->_markTransactionStatementFailure();
       return false;
     }
+
+    if ($statement === false) {
+      $this->_captureMySQLiFailure('prepare', 'Failed to prepare the database statement.');
+      $this->_markTransactionStatementFailure();
+      return false;
+    }
+
+    return $statement;
   }
 
   /**
    * Executes a prepared statement with parameters.
    *
-   * @param string $sql    SQL with placeholders (?)
-   * @param array  $params Parameters to bind
+   * @param array $params Parameters to bind
    * @return \mysqli_result|bool
    */
   public function execute(string $sql, array $params = []): \mysqli_result|bool
   {
-    $stmt = $this->prepare($sql);
-    if (!$stmt) {
+    $this->_affected_rows = 0;
+    $statement = $this->prepare($sql);
+    if (!$statement) {
       return false;
-    }
-
-    if (!empty($params)) {
-      $types = '';
-      foreach ($params as $param) {
-        $types .= $this->_getParamType($param);
-      }
-      $stmt->bind_param($types, ...$params);
     }
 
     try {
-      $stmt->execute();
-      $result = $stmt->get_result();
-      $stmt->close();
+      if ($params !== []) {
+        $types = '';
+        foreach ($params as $param) {
+          $types .= $this->_getParamType($param);
+        }
+
+        if (!$statement->bind_param($types, ...$params)) {
+          $this->_captureMySQLiFailure(
+            'execute',
+            'Failed to bind the prepared statement parameters.',
+            null,
+            $statement
+          );
+          $this->_markTransactionStatementFailure();
+          return false;
+        }
+      }
+
+      if (!$statement->execute()) {
+        $this->_captureMySQLiFailure(
+          'execute',
+          'Prepared statement execution failed.',
+          null,
+          $statement
+        );
+        $this->_markTransactionStatementFailure();
+        return false;
+      }
+
+      $this->_affected_rows = $statement->affected_rows;
+      $result = $statement->get_result();
+      $this->_clearLastDriverFailure();
       return $result !== false ? $result : true;
-    } catch (\Throwable $th) {
-      $this->_addError('execute', 256, $th->getMessage(), __FILE__, __LINE__);
+    } catch (\mysqli_sql_exception $e) {
+      $this->_captureMySQLiFailure(
+        'execute',
+        'Prepared statement execution failed.',
+        $e,
+        $statement
+      );
+      $this->_markTransactionStatementFailure();
       return false;
+    } catch (\Throwable $e) {
+      $this->_captureMySQLiFailure(
+        'execute',
+        'Prepared statement execution failed.',
+        $e,
+        $statement
+      );
+      $this->_markTransactionStatementFailure();
+      return false;
+    } finally {
+      $statement->close();
     }
   }
 
   /**
    * Fetches all rows from a prepared query.
    *
-   * @param string $sql
-   * @param array  $params
    * @return array|false
    */
   public function fetchAll(string $sql, array $params = []): array|false
@@ -307,8 +424,6 @@ class MySQLiDatabase {
   /**
    * Fetches a single row from a prepared query.
    *
-   * @param string $sql
-   * @param array  $params
    * @return array|false
    */
   public function fetchOne(string $sql, array $params = []): array|false
@@ -317,7 +432,7 @@ class MySQLiDatabase {
     if ($result instanceof \mysqli_result) {
       $row = $result->fetch_assoc();
       $result->free();
-      return $row ?? false;  // fetch_assoc() returns null on no rows → coerce to false
+      return $row ?? false;
     }
     return false;
   }
@@ -379,7 +494,7 @@ class MySQLiDatabase {
 
   public function affectedRows(): int
   {
-    return $this->_connection->affected_rows;
+    return $this->_affected_rows;
   }
 
   public function lastQuery(): ?string
@@ -388,25 +503,45 @@ class MySQLiDatabase {
   }
 
   /**
-   * Changes the current database.
-   *
-   * @param string $db_name
-   * @return bool
+   * Changes the current database unless a managed transaction is active.
    */
   public function changeDB(string $db_name): bool
   {
-    if ($db_name && $db_name !== $this->_db_name) {
-      if (!$this->_connection->select_db($db_name)) {
-        $err_arr = \error_get_last();
-        if ($err_arr) {
-          $this->_addError('changeDB', $err_arr['type'], $err_arr['message'], $err_arr['file'], $err_arr['line']);
-        }
-        return false;
-      }
-      $this->_db_name = $db_name;
-      return true;
+    $this->_affected_rows = 0;
+    $this->_clearLastDriverFailure();
+
+    if ($this->inTransaction()) {
+      $this->_addError(
+        'changeDB',
+        256,
+        'Cannot change the database during an active transaction.',
+        __FILE__,
+        __LINE__
+      );
+      return false;
     }
-    return false;
+
+    if (!$db_name || $db_name === $this->_db_name || !$this->checkConnection()) {
+      return false;
+    }
+
+    try {
+      $success = $this->_connection->select_db($db_name);
+    } catch (\mysqli_sql_exception $e) {
+      $this->_captureMySQLiFailure('changeDB', 'Failed to change the current database.', $e);
+      return false;
+    } catch (\Throwable $e) {
+      $this->_captureMySQLiFailure('changeDB', 'Failed to change the current database.', $e);
+      return false;
+    }
+
+    if (!$success) {
+      $this->_captureMySQLiFailure('changeDB', 'Failed to change the current database.');
+      return false;
+    }
+
+    $this->_db_name = $db_name;
+    return true;
   }
 
   // -------------------------------------------------------------------------
@@ -436,8 +571,179 @@ class MySQLiDatabase {
   }
 
   // -------------------------------------------------------------------------
+  // Native Transaction Adapter
+  // -------------------------------------------------------------------------
+
+  protected function _transactionConnectionAvailable(): bool
+  {
+    return $this->checkConnection();
+  }
+
+  protected function _nativeBeginTransaction(): bool
+  {
+    if (!$this->checkConnection()) {
+      return false;
+    }
+
+    try {
+      $success = $this->_connection->begin_transaction();
+    } catch (\mysqli_sql_exception $e) {
+      $this->_captureMySQLiFailure('beginTransaction', 'Native transaction begin failed.', $e);
+      return false;
+    } catch (\Throwable $e) {
+      $this->_captureMySQLiFailure('beginTransaction', 'Native transaction begin failed.', $e);
+      return false;
+    }
+
+    if (!$success) {
+      $this->_captureMySQLiFailure('beginTransaction', 'Native transaction begin failed.');
+    }
+    return $success;
+  }
+
+  protected function _nativeCommitTransaction(): bool
+  {
+    if (!$this->checkConnection()) {
+      return false;
+    }
+
+    try {
+      $success = $this->_connection->commit();
+    } catch (\mysqli_sql_exception $e) {
+      $this->_captureMySQLiFailure('commit', 'Native transaction commit failed.', $e);
+      return false;
+    } catch (\Throwable $e) {
+      $this->_captureMySQLiFailure('commit', 'Native transaction commit failed.', $e);
+      return false;
+    }
+
+    if (!$success) {
+      $this->_captureMySQLiFailure('commit', 'Native transaction commit failed.');
+    }
+    return $success;
+  }
+
+  protected function _nativeRollbackTransaction(): bool
+  {
+    if (!$this->checkConnection()) {
+      return false;
+    }
+
+    try {
+      $success = $this->_connection->rollback();
+    } catch (\mysqli_sql_exception $e) {
+      $this->_captureMySQLiFailure('rollBack', 'Native transaction rollback failed.', $e);
+      return false;
+    } catch (\Throwable $e) {
+      $this->_captureMySQLiFailure('rollBack', 'Native transaction rollback failed.', $e);
+      return false;
+    }
+
+    if (!$success) {
+      $this->_captureMySQLiFailure('rollBack', 'Native transaction rollback failed.');
+    }
+    return $success;
+  }
+
+  protected function _nativeCreateSavepoint(string $savepoint): bool
+  {
+    return $this->_executeTransactionControl(
+      "SAVEPOINT {$savepoint}",
+      'beginTransaction',
+      'Failed to create the transaction savepoint.'
+    );
+  }
+
+  protected function _nativeReleaseSavepoint(string $savepoint): bool
+  {
+    return $this->_executeTransactionControl(
+      "RELEASE SAVEPOINT {$savepoint}",
+      'commit',
+      'Failed to release the transaction savepoint.'
+    );
+  }
+
+  protected function _nativeRollbackToSavepoint(string $savepoint): bool
+  {
+    return $this->_executeTransactionControl(
+      "ROLLBACK TO SAVEPOINT {$savepoint}",
+      'rollBack',
+      'Failed to roll back to the transaction savepoint.'
+    );
+  }
+
+  protected function _nativeTransactionState(): ?bool
+  {
+    // MySQLi does not expose a portable native in-transaction state API.
+    return null;
+  }
+
+  // -------------------------------------------------------------------------
   // Private Helpers
   // -------------------------------------------------------------------------
+
+  private function _executeTransactionControl(
+    string $sql,
+    string $context,
+    string $safeMessage
+  ): bool {
+    if (!$this->checkConnection()) {
+      return false;
+    }
+
+    try {
+      $success = $this->_connection->query($sql);
+    } catch (\mysqli_sql_exception $e) {
+      $this->_captureMySQLiFailure($context, $safeMessage, $e);
+      return false;
+    } catch (\Throwable $e) {
+      $this->_captureMySQLiFailure($context, $safeMessage, $e);
+      return false;
+    }
+
+    if ($success === false) {
+      $this->_captureMySQLiFailure($context, $safeMessage);
+      return false;
+    }
+
+    return true;
+  }
+
+  private function _captureMySQLiFailure(
+    string $context,
+    string $safeMessage,
+    ?\Throwable $exception = null,
+    ?\mysqli_stmt $statement = null
+  ): void {
+    $driverCode = null;
+    $sqlState = null;
+
+    if ($exception !== null) {
+      $driverCode = $exception->getCode() !== 0 ? $exception->getCode() : null;
+      if (\method_exists($exception, 'getSqlState')) {
+        $sqlState = $exception->getSqlState();
+      }
+    }
+
+    if ($statement !== null) {
+      $driverCode ??= $statement->errno !== 0 ? $statement->errno : null;
+      $sqlState ??= $statement->sqlstate ?: null;
+    }
+
+    if ($this->_connection !== null) {
+      $driverCode ??= $this->_connection->errno !== 0 ? $this->_connection->errno : null;
+      $sqlState ??= $this->_connection->sqlstate ?: null;
+    }
+
+    $this->_setLastDriverFailure($driverCode, $sqlState);
+    $this->_addError(
+      $context,
+      \is_int($driverCode) && $driverCode !== 0 ? $driverCode : 256,
+      $safeMessage,
+      __FILE__,
+      __LINE__
+    );
+  }
 
   private function _getParamType(mixed $value): string
   {

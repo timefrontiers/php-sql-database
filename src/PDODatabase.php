@@ -4,10 +4,16 @@ declare(strict_types=1);
 
 namespace TimeFrontiers;
 
+use TimeFrontiers\Contracts\TransactionalConnectionInterface;
+use TimeFrontiers\Internal\ManagesTransactions;
+
 /**
  * PDO Database manager with interface compatible with MySQLiDatabase.
  */
-class PDODatabase {
+class PDODatabase implements TransactionalConnectionInterface
+{
+  use ManagesTransactions;
+
   protected \PDO|null $_pdo = null;
   protected string $_driver;
   protected string $_host;
@@ -18,6 +24,7 @@ class PDODatabase {
   protected array $_options;
   protected string|null $_last_query = null;
   protected array $_last_params = [];
+  protected int $_affected_rows = 0;
   protected array $_errors = [];
 
   /**
@@ -55,20 +62,46 @@ class PDODatabase {
 
   public function openConnection(): bool
   {
+    if ($this->_pdo !== null) {
+      $this->closeConnection();
+    }
+
+    $this->_resetTransactionState();
+    $this->_affected_rows = 0;
+    $this->_clearLastDriverFailure();
+
     try {
       $dsn = $this->_buildDsn();
-      $this->_pdo = new \PDO($dsn, $this->_username, $this->_password, $this->_getDefaultOptions());
+      $this->_pdo = new \PDO(
+        $dsn,
+        $this->_username,
+        $this->_password,
+        $this->_getDefaultOptions()
+      );
       $this->_pdo->setAttribute(\PDO::ATTR_ERRMODE, \PDO::ERRMODE_EXCEPTION);
       return true;
     } catch (\PDOException $e) {
-      $this->_addError('openConnection', 256, $e->getMessage(), __FILE__, __LINE__);
+      $this->_capturePDOFailure(
+        'openConnection',
+        'Failed to connect to the database.',
+        $e
+      );
+      $this->_pdo = null;
       return false;
     }
   }
 
   public function closeConnection(): void
   {
+    if ($this->_pdo === null) {
+      $this->_resetTransactionState();
+      return;
+    }
+
+    $this->_closeManagedTransaction();
     $this->_pdo = null;
+    $this->_affected_rows = 0;
+    $this->_resetTransactionState();
   }
 
   public function checkConnection(): bool
@@ -107,18 +140,32 @@ class PDODatabase {
 
   public function query(string $sql): \PDOStatement|false
   {
-    return $this->execute($sql, []);
+    $result = $this->execute($sql, []);
+    return $result instanceof \PDOStatement ? $result : false;
   }
 
   public function multiQuery(string $sql): bool
   {
+    $this->_last_query = $sql;
+    $this->_affected_rows = 0;
+    $this->_clearLastDriverFailure();
     $this->_addError('multiQuery', 256, 'multiQuery is not supported in PDO.', __FILE__, __LINE__);
+    $this->_markTransactionStatementFailure();
     return false;
   }
 
   public function confirmQuery($result): bool
   {
-    return $result !== false;
+    if ($result === false) {
+      if ($this->lastErrorCode() === null && $this->_pdo !== null) {
+        $this->_capturePDOFailure('query', 'Database query failed.');
+      }
+      $this->_markTransactionStatementFailure();
+      return false;
+    }
+
+    $this->_clearLastDriverFailure();
+    return true;
   }
 
   // -------------------------------------------------------------------------
@@ -127,61 +174,96 @@ class PDODatabase {
 
   public function prepare(string $sql): \PDOStatement|false
   {
+    $this->_last_query = $sql;
+    $this->_affected_rows = 0;
+    $this->_clearLastDriverFailure();
+
     if (!$this->checkConnection()) {
       $this->_addError('prepare', 256, 'No active Database connection.', __FILE__, __LINE__);
+      $this->_markTransactionStatementFailure();
       return false;
     }
-
-    $this->_last_query = $sql;
 
     try {
-      return $this->_pdo->prepare($sql);
+      $statement = $this->_pdo->prepare($sql);
     } catch (\PDOException $e) {
-      $this->_addError('prepare', 256, $e->getMessage(), __FILE__, __LINE__);
+      $this->_capturePDOFailure('prepare', 'Failed to prepare the database statement.', $e);
+      $this->_markTransactionStatementFailure();
       return false;
     }
+
+    if ($statement === false) {
+      $this->_capturePDOFailure('prepare', 'Failed to prepare the database statement.');
+      $this->_markTransactionStatementFailure();
+      return false;
+    }
+
+    return $statement;
   }
 
   public function execute(string $sql, array $params = []): \PDOStatement|bool
   {
+    $this->_last_query = $sql;
+    $this->_last_params = $params;
+    $this->_affected_rows = 0;
+    $this->_clearLastDriverFailure();
+
     if (!$this->checkConnection()) {
       $this->_addError('execute', 256, 'No active Database connection.', __FILE__, __LINE__);
+      $this->_markTransactionStatementFailure();
       return false;
     }
 
-    $this->_last_query = $sql;
-    $this->_last_params = $params;
-
     try {
-      $stmt = $this->_pdo->prepare($sql);
-      if (!$stmt) {
-        $this->_addError('execute', 256, 'Failed to prepare statement.', __FILE__, __LINE__);
+      $statement = $this->_pdo->prepare($sql);
+      if (!$statement) {
+        $this->_capturePDOFailure('execute', 'Failed to prepare the database statement.');
+        $this->_markTransactionStatementFailure();
         return false;
       }
-      $stmt->execute($params);
-      return $stmt;
+
+      if (!$statement->execute($params)) {
+        $this->_capturePDOFailure(
+          'execute',
+          'Prepared statement execution failed.',
+          null,
+          $statement
+        );
+        $this->_markTransactionStatementFailure();
+        return false;
+      }
+
+      $this->_affected_rows = $statement->rowCount();
+      $this->_clearLastDriverFailure();
+      return $statement;
     } catch (\PDOException $e) {
-      $this->_addError('execute', 256, $e->getMessage(), __FILE__, __LINE__);
+      $this->_capturePDOFailure(
+        'execute',
+        'Prepared statement execution failed.',
+        $e,
+        isset($statement) && $statement instanceof \PDOStatement ? $statement : null
+      );
+      $this->_markTransactionStatementFailure();
       return false;
     }
   }
 
   public function fetchAll(string $sql, array $params = []): array|false
   {
-    $stmt = $this->execute($sql, $params);
-    if (!$stmt) {
+    $statement = $this->execute($sql, $params);
+    if (!$statement instanceof \PDOStatement) {
       return false;
     }
-    return $stmt->fetchAll(\PDO::FETCH_ASSOC);
+    return $statement->fetchAll(\PDO::FETCH_ASSOC);
   }
 
   public function fetchOne(string $sql, array $params = []): array|false
   {
-    $stmt = $this->execute($sql, $params);
-    if (!$stmt) {
+    $statement = $this->execute($sql, $params);
+    if (!$statement instanceof \PDOStatement) {
       return false;
     }
-    $row = $stmt->fetch(\PDO::FETCH_ASSOC);
+    $row = $statement->fetch(\PDO::FETCH_ASSOC);
     return $row !== false ? $row : false;
   }
 
@@ -220,8 +302,7 @@ class PDODatabase {
 
   public function affectedRows(): int
   {
-    // PDO doesn't track this globally; use the statement's rowCount()
-    return 0;
+    return $this->_affected_rows;
   }
 
   public function lastQuery(): ?string
@@ -231,14 +312,45 @@ class PDODatabase {
 
   public function changeDB(string $db_name): bool
   {
-    if ($this->_driver === 'mysql') {
-      $result = $this->execute("USE `{$db_name}`");
-      if ($result) {
-        $this->_database = $db_name;
-        return true;
-      }
+    $this->_affected_rows = 0;
+    $this->_clearLastDriverFailure();
+
+    if ($this->inTransaction()) {
+      $this->_addError(
+        'changeDB',
+        256,
+        'Cannot change the database during an active transaction.',
+        __FILE__,
+        __LINE__
+      );
+      return false;
     }
-    return false;
+
+    if (
+      $this->_driver !== 'mysql' ||
+      $db_name === '' ||
+      $db_name === $this->_database ||
+      !$this->checkConnection()
+    ) {
+      return false;
+    }
+
+    $quotedDatabase = \str_replace('`', '``', $db_name);
+
+    try {
+      $result = $this->_pdo->exec("USE `{$quotedDatabase}`");
+    } catch (\PDOException $e) {
+      $this->_capturePDOFailure('changeDB', 'Failed to change the current database.', $e);
+      return false;
+    }
+
+    if ($result === false) {
+      $this->_capturePDOFailure('changeDB', 'Failed to change the current database.');
+      return false;
+    }
+
+    $this->_database = $db_name;
+    return true;
   }
 
   // -------------------------------------------------------------------------
@@ -278,8 +390,172 @@ class PDODatabase {
   }
 
   // -------------------------------------------------------------------------
+  // Native Transaction Adapter
+  // -------------------------------------------------------------------------
+
+  protected function _transactionConnectionAvailable(): bool
+  {
+    return $this->checkConnection();
+  }
+
+  protected function _nativeBeginTransaction(): bool
+  {
+    if (!$this->checkConnection()) {
+      return false;
+    }
+
+    try {
+      $success = $this->_pdo->beginTransaction();
+    } catch (\PDOException $e) {
+      $this->_capturePDOFailure('beginTransaction', 'Native transaction begin failed.', $e);
+      return false;
+    }
+
+    if (!$success) {
+      $this->_capturePDOFailure('beginTransaction', 'Native transaction begin failed.');
+    }
+    return $success;
+  }
+
+  protected function _nativeCommitTransaction(): bool
+  {
+    if (!$this->checkConnection()) {
+      return false;
+    }
+
+    try {
+      $success = $this->_pdo->commit();
+    } catch (\PDOException $e) {
+      $this->_capturePDOFailure('commit', 'Native transaction commit failed.', $e);
+      return false;
+    }
+
+    if (!$success) {
+      $this->_capturePDOFailure('commit', 'Native transaction commit failed.');
+    }
+    return $success;
+  }
+
+  protected function _nativeRollbackTransaction(): bool
+  {
+    if (!$this->checkConnection()) {
+      return false;
+    }
+
+    try {
+      $success = $this->_pdo->rollBack();
+    } catch (\PDOException $e) {
+      $this->_capturePDOFailure('rollBack', 'Native transaction rollback failed.', $e);
+      return false;
+    }
+
+    if (!$success) {
+      $this->_capturePDOFailure('rollBack', 'Native transaction rollback failed.');
+    }
+    return $success;
+  }
+
+  protected function _nativeCreateSavepoint(string $savepoint): bool
+  {
+    return $this->_executeTransactionControl(
+      "SAVEPOINT {$savepoint}",
+      'beginTransaction',
+      'Failed to create the transaction savepoint.'
+    );
+  }
+
+  protected function _nativeReleaseSavepoint(string $savepoint): bool
+  {
+    return $this->_executeTransactionControl(
+      "RELEASE SAVEPOINT {$savepoint}",
+      'commit',
+      'Failed to release the transaction savepoint.'
+    );
+  }
+
+  protected function _nativeRollbackToSavepoint(string $savepoint): bool
+  {
+    return $this->_executeTransactionControl(
+      "ROLLBACK TO SAVEPOINT {$savepoint}",
+      'rollBack',
+      'Failed to roll back to the transaction savepoint.'
+    );
+  }
+
+  protected function _nativeTransactionState(): ?bool
+  {
+    if (!$this->checkConnection()) {
+      return false;
+    }
+
+    try {
+      return $this->_pdo->inTransaction();
+    } catch (\PDOException $e) {
+      $this->_capturePDOFailure('inTransaction', 'Failed to inspect native transaction state.', $e);
+      return null;
+    }
+  }
+
+  // -------------------------------------------------------------------------
   // Private Helpers
   // -------------------------------------------------------------------------
+
+  private function _executeTransactionControl(
+    string $sql,
+    string $context,
+    string $safeMessage
+  ): bool {
+    if (!$this->checkConnection()) {
+      return false;
+    }
+
+    try {
+      $result = $this->_pdo->exec($sql);
+    } catch (\PDOException $e) {
+      $this->_capturePDOFailure($context, $safeMessage, $e);
+      return false;
+    }
+
+    if ($result === false) {
+      $this->_capturePDOFailure($context, $safeMessage);
+      return false;
+    }
+
+    return true;
+  }
+
+  private function _capturePDOFailure(
+    string $context,
+    string $safeMessage,
+    ?\PDOException $exception = null,
+    ?\PDOStatement $statement = null
+  ): void {
+    $errorInfo = $exception?->errorInfo;
+
+    if (!\is_array($errorInfo) && $statement !== null) {
+      $errorInfo = $statement->errorInfo();
+    }
+    if (!\is_array($errorInfo) && $this->_pdo !== null) {
+      $errorInfo = $this->_pdo->errorInfo();
+    }
+
+    $sqlState = isset($errorInfo[0]) && \is_string($errorInfo[0]) && $errorInfo[0] !== '00000'
+      ? $errorInfo[0]
+      : null;
+    $driverCode = $errorInfo[1] ?? $exception?->getCode();
+    if ($driverCode === 0 || $driverCode === '00000') {
+      $driverCode = null;
+    }
+
+    $this->_setLastDriverFailure($driverCode, $sqlState);
+    $this->_addError(
+      $context,
+      \is_int($driverCode) && $driverCode !== 0 ? $driverCode : 256,
+      $safeMessage,
+      __FILE__,
+      __LINE__
+    );
+  }
 
   private function _buildDsn(): string
   {
@@ -300,7 +576,10 @@ class PDODatabase {
     ];
 
     if ($this->_driver === 'mysql') {
-      $defaults[\PDO::MYSQL_ATTR_INIT_COMMAND] = "SET NAMES utf8mb4";
+      $initCommandAttribute = \defined('Pdo\\Mysql::ATTR_INIT_COMMAND')
+        ? \constant('Pdo\\Mysql::ATTR_INIT_COMMAND')
+        : \constant('PDO::MYSQL_ATTR_INIT_COMMAND');
+      $defaults[$initCommandAttribute] = 'SET NAMES utf8mb4';
     }
 
     return $this->_options + $defaults;
