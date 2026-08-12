@@ -3,7 +3,7 @@
 A small SQL database manager supporting MySQLi and PDO through a compatible
 prepared-query and transaction API.
 
-[![PHP Version](https://img.shields.io/badge/php-%3E%3D8.4-8892BF.svg)](https://php.net/)
+[![PHP Version](https://img.shields.io/badge/php-%3E%3D8.5-8892BF.svg)](https://php.net/)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
 ## Features
@@ -19,7 +19,7 @@ prepared-query and transaction API.
 
 ## Requirements
 
-- PHP 8.4 or higher.
+- PHP 8.5 or higher.
 - `ext-mysqli`.
 - `ext-pdo` and the appropriate PDO driver when using PDO.
 
@@ -167,6 +167,22 @@ rethrown unchanged when rollback succeeds. Begin, commit, and rollback
 infrastructure failures use the public exception hierarchy under
 `TimeFrontiers\Exceptions`.
 
+Do not call `beginTransaction()`, `commit()`, or `rollBack()` inside a callback
+in a way that leaves the wrapper owning a different scope than it opened. The
+wrapper validates scope ownership by identity and throws `TransactionException`
+rather than guessing which scope to close. Two consequences matter:
+
+- if the callback **left an extra scope open**, that exception arrives with the
+  connection still inside a transaction at the deeper level, and neither the
+  leaked scope nor the wrapper's own scope has been closed. The caller now owns
+  cleanup — roll back or close the connection.
+- if the callback **already committed the wrapper's own scope**, the native
+  commit has succeeded and the work is durable. `TransactionException` here does
+  **not** mean the operation had no effect.
+
+Neither case is a rollback. Inspect `transactionDepth()` and reconcile state
+before deciding what to do.
+
 ## Nested scopes and rollback-only behavior
 
 Nested `beginTransaction()` or `transaction()` calls create library-generated
@@ -196,6 +212,11 @@ becomes rollback-only. A later `commit()` rolls that scope back, records a
 transaction error, and returns `false`. The callback API throws
 `TransactionException`. Empty SELECT results and successful DML affecting zero
 rows do not mark a scope rollback-only.
+
+A failure of the transaction machinery itself — begin, savepoint, commit,
+release, or rollback — marks **every** open scope rollback-only, not just the
+current one, because no remaining scope can be proven safe to commit. A failed
+nested `SAVEPOINT` will therefore also cause a clean parent scope to roll back.
 
 Calling `execute()` lets the package observe failures and affected rows. If a
 caller obtains a native statement from `prepare()` and executes that native

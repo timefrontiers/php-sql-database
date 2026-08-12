@@ -1,15 +1,41 @@
 # Upgrading
 
-## Upgrading from 1.x to 2.0.0
+## Upgrading from 1.0.x to 1.1.x
 
-This transaction-safety upgrade is intended for the `2.0.0` release. No version
-or tag is created by the source change itself.
+This transaction-safety upgrade ships within the coordinated `1.1.x` project
+generation. `2.0` is reserved for a later deliberate platform shift.
+
+The change is additive. Callers that do not use transactions need no source
+changes; the only requirement to clear is the PHP runtime.
+
+Target `1.1.1` or later. `1.1.0` carries the same driver behaviour, but its
+documentation of rollback-only propagation was incorrect and its
+`TransactionalConnectionInterface` does not declare the diagnostic accessors.
 
 ## PHP requirement
 
-Version 2.0.0 requires PHP 8.4 or later. Applications that must remain on an
-older PHP runtime should continue using a compatible 1.x release until their
-runtime and dependency graph are ready to upgrade.
+`1.1.1` requires PHP 8.5 or later. The floor moved in two steps — `>=8.1` in
+`1.0.x`, `>=8.4` in `1.1.0`, `>=8.5` from `1.1.1` — completing the move to the
+first-party 8.5 platform baseline.
+
+This is a platform requirement, not an API break. Composer evaluates it during
+resolution, so a project on an older runtime is not broken by it — it simply
+will not be offered a release it cannot satisfy, and stays on the newest version
+it can. Upgrade the runtime first, then resolve `^1.1`.
+
+## Upgrading from 1.1.0 to 1.1.1
+
+No driver behaviour changed. Two things to be aware of:
+
+- the PHP floor moved from `>=8.4` to `>=8.5`; and
+- `TransactionalConnectionInterface` now declares `lastErrorCode()` and
+  `lastSqlState()`. Every implementation shipped in this package already had
+  them, so no first-party code changes — but if your application implements that
+  interface itself, add both methods before upgrading.
+
+Re-read "Nested scopes and failed statements" below. The `1.1.0` documentation
+understated how far rollback-only propagates, and code written against it may
+have assumed a failed nested scope was recoverable.
 
 ## Preserved APIs
 
@@ -68,16 +94,45 @@ A `TransactionCommitException` represents a potentially uncertain database
 outcome. Consumers must reconcile state before deciding whether any business
 operation can be repeated.
 
+### Callbacks that change their own scope
+
+`transaction()` validates that it still owns exactly the scope it opened,
+identified by scope identity rather than depth alone. If a callback manipulates
+the transaction directly and breaks that ownership, the wrapper raises
+`TransactionException` instead of guessing which scope to close — and does not
+roll anything back. The resulting state depends on what the callback did:
+
+| Callback behaviour | State when the exception is thrown |
+| --- | --- |
+| Left an extra scope open | Still inside a transaction, at the deeper depth; nothing closed. The caller must roll back or close the connection. |
+| Already committed the wrapper's scope | Depth is back to its starting value and **the work is committed and durable**. |
+
+The second row is the important one: this `TransactionException` does not imply
+the operation had no effect. Like `TransactionCommitException`, treat it as an
+uncertain outcome and reconcile before retrying anything.
+
 ## Nested scopes and failed statements
 
 An outer scope uses the driver's native transaction API. Each nested scope uses
 a generated savepoint. Inner rollback discards only inner work when the native
 database successfully rolls back to and releases the savepoint.
 
-Failed package-managed statements mark only their current scope rollback-only.
-Committing that scope rolls it back and returns `false`; the callback form
-throws `TransactionException`. A parent that failed remains rollback-only even
-if later child work succeeds.
+Failed package-managed **statements** mark only their current scope
+rollback-only. Committing that scope rolls it back and returns `false`; the
+callback form throws `TransactionException`. A parent that failed remains
+rollback-only even if later child work succeeds.
+
+Transaction **infrastructure** failures propagate further. When a begin,
+savepoint, commit, release, or rollback operation itself fails, every currently
+open scope is marked rollback-only, because the nesting contract can no longer
+be honoured and no scope can be proven safe to commit. A failed nested
+`SAVEPOINT` therefore also poisons an otherwise clean parent: the parent's
+`commit()` will roll its work back and return `false`.
+
+This is deliberate fail-closed behaviour, but it means a savepoint failure is
+not recoverable by catching it and continuing the outer scope. Treat any
+`false` from `beginTransaction()` inside an existing transaction as fatal to
+the whole operation.
 
 Use the package's `execute()` method when rollback-only observation is needed.
 Execution performed directly on a native statement returned by `prepare()` is
@@ -101,6 +156,11 @@ Both drivers and the facade add:
 lastErrorCode(): int|string|null
 lastSqlState(): ?string
 ```
+
+Both are declared on `TransactionalConnectionInterface`, so code that type-hints
+the contract rather than a concrete driver can classify duplicate keys,
+deadlocks, and lock timeouts without widening to the concrete union. Any
+external implementation of that interface must now provide them.
 
 These values are also available on the new database exceptions. New prepared
 statement error messages use safe operational text and do not copy bound values
@@ -143,8 +203,11 @@ The old constructor is retained.
 - There is no automatic retry.
 - External side effects must remain outside transaction callbacks.
 
-## Recommended versioning
+## Consumer constraint
 
-After the change is accepted, `2.0.0` is the recommended next version. Do not
-update consumer constraints to a mutable branch; use the accepted commit during
-controlled development and the `^2.0` constraint after release.
+Require `timefrontiers/php-sql-database: ^1.1` and verify the resolved version
+and reference in the consuming application after Composer resolution. Do not
+point a consumer at a mutable branch, and do not edit installed lock metadata by
+hand — raise the floor through a documented package release instead.
+
+Subsequent corrections on this line ship as `1.1.x`.
